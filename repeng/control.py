@@ -32,7 +32,7 @@ class ControlModel(torch.nn.Module):
         for layer_id in layer_ids:
             layer = layers[layer_id]
             if not isinstance(layer, ControlModule):
-                layers[layer_id] = ControlModule(layer)
+                layers[layer_id] = ControlModule(layer, model_type=model.config.model_type)
             else:
                 warnings.warn(
                     "Trying to rewrap a wrapped model! Probably not what you want! Try calling .unwrap first."
@@ -135,10 +135,21 @@ class BlockControlParams:
 
 
 class ControlModule(torch.nn.Module):
-    def __init__(self, block: torch.nn.Module) -> None:
+    def __init__(self, block: torch.nn.Module, model_type: str = None) -> None:
         super().__init__()
         self.block: torch.nn.Module = block
         self.params: BlockControlParams = BlockControlParams.default()
+        self.model_type = model_type
+        
+        # Create a set of known attributes that might be accessed
+        # This prevents AttributeError for common architecture-specific attributes
+        self._attribute_defaults = {
+            'attention_type': 'standard',  # Common in older models
+            'layer_idx': None,  # Common in newer models
+            'is_causal': True,  # Common attention attribute
+            'rope_theta': 10000.0,  # RoPE parameter
+            'max_position_embeddings': 2048,  # Position encoding
+        }
 
     def set_control(self, params: BlockControlParams) -> None:
         self.params = params
@@ -197,22 +208,52 @@ class ControlModule(torch.nn.Module):
         return output
 
     def __getattr__(self, name: str) -> typing.Any:
-        if name in ("block", "params"):
-            # our properties - return normally
+        # First check if it's one of our own attributes
+        if name in ("block", "params", "model_type", "_attribute_defaults"):
             return super().__getattr__(name)
-        # delegate attr to wrapped module
-        return getattr(super().__getattr__("block"), name)
+        
+        # Try to get from the wrapped block
+        try:
+            return getattr(self.block, name)
+        except AttributeError:
+            # If the attribute doesn't exist on the block, check if we have a default
+            if hasattr(self, '_attribute_defaults') and name in self._attribute_defaults:
+                return self._attribute_defaults[name]
+            
+            # Log a debug warning for unknown attributes (can be removed in production)
+            if not name.startswith('_'):  # Ignore private attributes
+                warnings.warn(
+                    f"Attribute '{name}' not found on {type(self.block).__name__}. "
+                    f"This might indicate model incompatibility. Returning None.",
+                    stacklevel=2
+                )
+            return None
 
 
 def model_layer_list(model: ControlModel | PreTrainedModel) -> torch.nn.ModuleList:
+    """
+    Get the list of transformer layers from various model architectures.
+    Supports multiple naming conventions used by different model families.
+    """
     if isinstance(model, ControlModel):
         model = model.model
 
+    # Extended list of possible layer paths for different architectures
     target_suffixes = [
         "repeng_layers",  # override
-        "model.layers",  # llama, mistral, gemma, qwen, ...
-        "transformer.h",  # gpt-2
+        "model.layers",  # llama, mistral, gemma, qwen2, qwen3, yi, deepseek, ...
+        "transformer.h",  # gpt-2, gpt-j
+        "transformer.blocks",  # mpt
+        "gpt_neox.layers",  # gpt-neox
+        "transformer.layers",  # gpt-neox alternative
+        "model.decoder.layers",  # opt
+        "bert.encoder.layer",  # bert
+        "encoder.layer",  # bert alternative
+        "h",  # some gpt2 variants
+        "transformer.layer",  # some transformer models
+        "blocks",  # some custom architectures
     ]
+    
     for suffix in target_suffixes:
         candidates = [
             v
@@ -221,7 +262,32 @@ def model_layer_list(model: ControlModel | PreTrainedModel) -> torch.nn.ModuleLi
         ]
         if len(candidates) == 1:
             return candidates[0]
+    
+    # If we still haven't found it, try a more flexible approach
+    # Look for any ModuleList that contains transformer-like layers
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.ModuleList) and len(module) > 0:
+            # Check if the first element looks like a transformer layer
+            # (has attention and/or mlp components)
+            first_layer = module[0]
+            has_attention = any(
+                'attn' in n or 'attention' in n 
+                for n, _ in first_layer.named_modules()
+            )
+            has_mlp = any(
+                'mlp' in n or 'ffn' in n or 'feedforward' in n 
+                for n, _ in first_layer.named_modules()
+            )
+            
+            if has_attention or has_mlp:
+                warnings.warn(
+                    f"Using heuristic to find layers at '{name}'. "
+                    f"Consider setting model.repeng_layers explicitly for better control."
+                )
+                return module
 
     raise ValueError(
-        f"don't know how to get layer list for {type(model)}! try assigning `model.repeng_layers = ...` to override this search."
+        f"don't know how to get layer list for {type(model).__name__}! "
+        f"Please set model.repeng_layers = model.<path_to_layers> before passing to ControlModel. "
+        f"Common paths: model.layers, transformer.h, transformer.blocks"
     )
